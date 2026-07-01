@@ -425,14 +425,20 @@ class RGSSPDTrainer:
         self.heads.to(device)
 
         # Fusion logit: per-class learnable alpha (same pattern as RAVEKneeV2)
+        # Init at 0.0 → sigmoid(0)=0.5: equal adapter/backbone blend at start
         self.fusion_logit = nn.Parameter(
-            torch.full((num_classes,), -2.2, device=device)
+            torch.full((num_classes,), 0.0, device=device)
         )
 
         all_params = (list(self.heads.parameters()) + [self.fusion_logit])
         self.optimizer = torch.optim.AdamW(all_params, lr=1e-4, weight_decay=1e-4)
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             self.optimizer, T_max=50
+        )
+
+        self._device_type = (
+            device.type if isinstance(device, torch.device)
+            else str(device).split(":")[0]
         )
 
     # ------------------------------------------------------------------
@@ -583,7 +589,8 @@ class RGSSPDTrainer:
                     msk.squeeze(0),
                     self.cfg.num_classes,
                 )
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                with torch.autocast(device_type=self._device_type, dtype=torch.bfloat16,
+                                    enabled=(self._device_type == "cuda")):
                     adapted = head(feats, protos)                      # (1,C,Ds,Hs,Ws)
                     # Upsample to mask size and get logits
                     logits = head.seg_proj(adapted)
@@ -630,6 +637,16 @@ class RGSSPDTrainer:
         val_subjs = sub_subjects[-n_val:]
         train_subjs = sub_subjects[:-n_val]
 
+        # Rebuild subindex from train_subjs only — prevents val leakage and
+        # ensures FAISS indices are always valid for train_subjs (Bug B fix).
+        n_train = len(train_subjs)
+        train_embs = sub_embs[:n_train].copy()
+        faiss.normalize_L2(train_embs)
+        _d = train_embs.shape[1]
+        train_subindex = faiss.IndexFlatIP(_d)
+        train_subindex.add(train_embs)
+        subindex = train_subindex  # shadow the full subindex
+
         params = list(head.parameters()) + [self.fusion_logit]
         opt = torch.optim.AdamW(params, lr=1e-4, weight_decay=1e-4)
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=num_epochs)
@@ -658,8 +675,10 @@ class RGSSPDTrainer:
                 with torch.no_grad():
                     emb_q = _extract_embedding(self.backbone, vol_q)
 
-                # 2. Severity-matched retrieval
-                support = self._retrieve_from_subindex(emb_q, subindex, train_subjs, k)
+                # 2. Severity-matched retrieval (exclude self to prevent trivial support)
+                support = [s for s in
+                           self._retrieve_from_subindex(emb_q, subindex, train_subjs, k + 1)
+                           if s is not qsubj][:k]
                 if not support:
                     continue
 
@@ -670,7 +689,8 @@ class RGSSPDTrainer:
 
                 # 5. Forward through specialist head (with grad)
                 opt.zero_grad()
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                with torch.autocast(device_type=self._device_type, dtype=torch.bfloat16,
+                                    enabled=(self._device_type == "cuda")):
                     feats_q = _extract_stage3(self.backbone, vol_q)  # frozen
                     adapted = head(feats_q, protos)                   # (1,C,Ds,Hs,Ws)
 
@@ -839,11 +859,44 @@ class RGSSPDInference:
         self.temperature = temperature
         self.transform_fn = transform_fn
 
+        self._device_type = (
+            device.type if isinstance(device, torch.device)
+            else str(device).split(":")[0]
+        )
+
         for p in backbone.parameters():
             p.requires_grad_(False)
         backbone.eval()
         for h in specialist_heads.values():
             h.eval()
+
+        # Build per-stratum sub-indices for prototype retrieval (Bug A fix)
+        self._stratum_subindices: Dict[str, Any] = {}
+        self._stratum_subjlists: Dict[str, List[Any]] = {}
+        self._build_stratum_subindices()
+
+    # ------------------------------------------------------------------
+    def _build_stratum_subindices(self) -> None:
+        """Build per-stratum FAISS IndexFlatIP for severity-matched retrieval."""
+        strata_grades = {"mild": [0, 1], "moderate": [2], "severe": [3, 4]}
+        d = self.index_embeddings.shape[1]
+        for st, grades in strata_grades.items():
+            sub_idx_list, sub_subjs = [], []
+            for i, subj in enumerate(self.train_subjects):
+                sid = getattr(subj, "subject_id", None)
+                kl = self.kl_lookup.get(sid) if sid is not None else None
+                if kl in grades:
+                    sub_idx_list.append(i)
+                    sub_subjs.append(subj)
+            if sub_idx_list:
+                sub_embs = self.index_embeddings[sub_idx_list].copy()
+                faiss.normalize_L2(sub_embs)
+                idx = faiss.IndexFlatIP(d)
+                idx.add(sub_embs)
+                self._stratum_subindices[st] = idx
+            else:
+                self._stratum_subindices[st] = faiss.IndexFlatIP(d)
+            self._stratum_subjlists[st] = sub_subjs
 
     # ------------------------------------------------------------------
     def compute_blend_weights(self, top_k_indices: np.ndarray) -> torch.Tensor:
@@ -936,10 +989,15 @@ class RGSSPDInference:
             neighbor_kl.append(kl)
 
         # 4. Stage-3 features for support subjects + 5. per-specialist prototypes
-        dummy_head = next(iter(self.heads.values()))
-
+        # Each stratum retrieves its own severity-matched neighbors (Bug A fix).
         def _get_support_protos(stratum: str) -> Optional[torch.Tensor]:
-            support_subjs = [self.train_subjects[int(i)] for i in indices if i >= 0]
+            subidx = self._stratum_subindices.get(stratum)
+            sub_subjs = self._stratum_subjlists.get(stratum, [])
+            if not sub_subjs or subidx is None or subidx.ntotal == 0:
+                return None
+            k_eff = min(k, len(sub_subjs))
+            _, st_idxs = subidx.search(q_f32.copy(), k_eff)
+            support_subjs = [sub_subjs[i] for i in st_idxs[0] if i >= 0]
             if not support_subjs:
                 return None
             all_feats, all_masks = [], []
@@ -956,7 +1014,7 @@ class RGSSPDInference:
                 return None
             sf = torch.stack(all_feats, 0)
             sm = torch.stack(all_masks, 0)
-            return dummy_head.extract_prototypes(sf, sm, self.cfg.num_classes)
+            return self.heads[stratum].extract_prototypes(sf, sm, self.cfg.num_classes)
 
         proto_mild = _get_support_protos("mild")
         proto_mod = _get_support_protos("moderate")
@@ -983,9 +1041,12 @@ class RGSSPDInference:
         backbone = self.backbone
         bw = blend_weights
 
+        _dev_type = self._device_type
+
         def patch_fn(patch: torch.Tensor) -> torch.Tensor:
             """Sliding-window patch function merging specialist + baseline."""
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            with torch.autocast(device_type=_dev_type, dtype=torch.bfloat16,
+                                enabled=(_dev_type == "cuda")):
                 # Frozen baseline
                 logits_base = backbone.model(patch).float()
 
@@ -997,13 +1058,14 @@ class RGSSPDInference:
                 out_mod  = heads["moderate"](q_feats, proto_mod)
                 out_sev  = heads["severe"](q_feats, proto_sev)
 
-                # Blend specialist outputs (same weights as prototype blend)
-                out_blended = (bw[0] * out_mild +
-                               bw[1] * out_mod +
-                               bw[2] * out_sev)
-
-                # Project adapted features → logits
-                logits_adapt = heads["mild"].seg_proj(out_blended).float()
+                # Project each specialist independently then blend in logit space
+                # (Bug C fix: each head's seg_proj trained for its own distribution)
+                logits_mild_p = heads["mild"].seg_proj(out_mild).float()
+                logits_mod_p  = heads["moderate"].seg_proj(out_mod).float()
+                logits_sev_p  = heads["severe"].seg_proj(out_sev).float()
+                logits_adapt = (bw[0] * logits_mild_p +
+                                bw[1] * logits_mod_p +
+                                bw[2] * logits_sev_p)
                 logits_adapt_up = F.interpolate(
                     logits_adapt, size=logits_base.shape[2:],
                     mode="trilinear", align_corners=False
@@ -1014,10 +1076,10 @@ class RGSSPDInference:
             logits = alpha_v * logits_adapt_up + (1.0 - alpha_v) * logits_base
             return logits
 
-        # 10. MONAI sliding-window inference
+        # 10. MONAI sliding-window inference (overlap=0.75 for better boundary Dice)
         if SlidingWindowInferer is not None:
             inferer = SlidingWindowInferer(
-                roi_size=self.cfg.img_size, sw_batch_size=1, overlap=0.5,
+                roi_size=self.cfg.img_size, sw_batch_size=1, overlap=0.75,
                 mode="gaussian"
             )
             logits_full = inferer(vol_q, patch_fn)         # (1, nc, D, H, W)
@@ -1111,6 +1173,10 @@ class RGSSPDAblationRunner:
         self.device = device
         self.rave_v2 = rave_v2
         self.transform_fn = transform_fn
+        self._device_type = (
+            device.type if isinstance(device, torch.device)
+            else str(device).split(":")[0]
+        )
 
     # ------------------------------------------------------------------
     def _make_inferer(self, temperature: float = 1.0,
@@ -1206,6 +1272,93 @@ class RGSSPDAblationRunner:
         return inferer_obj.predict(subject, {"support_indices": random_indices.tolist()})
 
     # ------------------------------------------------------------------
+    @torch.inference_mode()
+    def _single_shared_head_predict(self, subject: Any) -> dict:
+        """A7: same retrieval as A4 but routes all strata through the mild head.
+
+        Ablates the benefit of having three *separate* specialist heads: the
+        retrieval mechanism and prototype extraction are identical to A4, but
+        instead of blending three independently-trained projections, a single
+        shared head (mild) handles the entire forward pass.
+        """
+        vol_q, msk_q = _vol_to_tensor(subject, self.cfg, self.device, self.transform_fn)
+        vol_q_padded = _pad_to(vol_q, self.cfg.img_size)
+
+        emb_q = _extract_embedding(self.backbone, vol_q_padded)
+        q_f32 = emb_q.reshape(1, -1).copy()
+        faiss.normalize_L2(q_f32)
+        k = getattr(self.cfg, "k_neighbors", 3)
+        distances, indices = self.faiss_index.search(q_f32, k)
+        distances, indices = distances[0], indices[0]
+
+        shared_head = self.heads["mild"]
+        shared_head.eval()
+        alpha = torch.sigmoid(self.fusion_logit).to(self.device)
+        nc = self.cfg.num_classes
+        backbone = self.backbone
+
+        # Retrieve support subjects (no stratum filter; shared head handles all)
+        support_subjs = [self.train_subjects[int(i)] for i in indices if i >= 0]
+        all_feats, all_masks = [], []
+        for s in support_subjs:
+            v, m = _vol_to_tensor(s, self.cfg, self.device, self.transform_fn)
+            if m is None:
+                continue
+            v = _pad_to(v, self.cfg.img_size)
+            m = _pad_to(m.float(), self.cfg.img_size).long()
+            f = _extract_stage3(self.backbone, v)
+            all_feats.append(f.squeeze(0))
+            all_masks.append(m.squeeze())
+
+        C = _stage3_channels(self.cfg)
+        if all_feats:
+            sf = torch.stack(all_feats, 0)
+            sm = torch.stack(all_masks, 0)
+            proto = shared_head.extract_prototypes(sf, sm, nc)
+        else:
+            proto = torch.zeros(nc, C, device=self.device)
+
+        _dev_type = self._device_type
+
+        def patch_fn(patch: torch.Tensor) -> torch.Tensor:
+            with torch.autocast(device_type=_dev_type, dtype=torch.bfloat16,
+                                enabled=(_dev_type == "cuda")):
+                logits_base = backbone.model(patch).float()
+                q_feats = _extract_stage3(backbone, patch)
+                adapted = shared_head(q_feats, proto)
+                logits_adapt = shared_head.seg_proj(adapted).float()
+                logits_adapt_up = F.interpolate(
+                    logits_adapt, size=logits_base.shape[2:],
+                    mode="trilinear", align_corners=False
+                )
+            alpha_v = alpha.view(1, nc, 1, 1, 1)
+            return alpha_v * logits_adapt_up + (1.0 - alpha_v) * logits_base
+
+        if SlidingWindowInferer is not None:
+            inferer = SlidingWindowInferer(
+                roi_size=self.cfg.img_size, sw_batch_size=1, overlap=0.75,
+                mode="gaussian"
+            )
+            logits_full = inferer(vol_q, patch_fn)
+        else:
+            logits_full = patch_fn(vol_q_padded)
+
+        pred_np = logits_full.argmax(dim=1).squeeze(0).cpu().numpy().astype(np.int8)
+        unc = (1 - torch.softmax(logits_full, dim=1).max(dim=1).values
+               ).squeeze(0).cpu().numpy().astype(np.float32)
+        gt_np = msk_q.squeeze().cpu().numpy().astype(np.int8) if msk_q is not None else None
+
+        del logits_full
+        torch.cuda.empty_cache()
+
+        return {
+            "pred_mask": pred_np, "gt_mask": gt_np, "uncertainty": unc,
+            "blend_weights": np.array([1 / 3, 1 / 3, 1 / 3]),
+            "neighbor_kl_grades": [], "support_indices": indices.tolist(),
+            "support_distances": distances.tolist(),
+        }
+
+    # ------------------------------------------------------------------
     def run_condition(
         self, condition: str, subjects: Optional[List[Any]] = None,
         n_eval: Optional[int] = None,
@@ -1265,8 +1418,8 @@ class RGSSPDAblationRunner:
                     r = self._make_inferer(temperature=10.0).predict(subj, {})
 
                 elif condition == "A7":
-                    # Severity-matched retrieval but single shared head (mild)
-                    r = self._make_inferer(temperature=1.0).predict(subj, {})
+                    # Severity-matched retrieval, single shared head (ablates multi-head)
+                    r = self._single_shared_head_predict(subj)
 
                 elif condition == "A8":
                     r = self._random_support_predict(subj)
@@ -1411,9 +1564,6 @@ class RGSSPDAblationRunner:
                .round(3))
 
         # Find best per column
-        mean_cols = [(c, "mean") for c in ["mean_dice", "dice_FC", "dice_TC",
-                                             "dice_PC"]]
-        hd_cols = [("mean_hd95", "mean")]
         bests_high = {c: agg[(c, "mean")].max() for c in
                       ["mean_dice", "dice_FC", "dice_TC", "dice_PC"]}
         bests_low = {"mean_hd95": agg[("mean_hd95", "mean")].min()}
@@ -1478,7 +1628,6 @@ def plot_blend_weight_vs_true_kl(
 
     kl_jittered = kl + np.random.normal(0, 0.08, size=len(kl))
     colors = {0: "#1f77b4", 1: "#17becf", 2: "#bcbd22", 3: "#ff7f0e", 4: "#d62728"}
-    c_arr = [colors.get(int(k), "#888888") for k in kl]
 
     rho, pval = scipy_stats.spearmanr(kl, sev_score)
 
