@@ -36,6 +36,12 @@ directly — improving OA trial efficiency and enabling trustworthy deployment.
    feature computation itself. Ablation isolates FiLM vs. no-conditioning vs.
    input-concatenation vs. hard routing.
 
+   The SACN encoder is built from **3D Mamba / selective state-space (S6)
+   blocks** (bidirectional scan over the flattened volume), giving a
+   linear-time global receptive field for the thin, spatially-extended
+   cartilage sheets — replacing convolutional blocks with a stronger,
+   modern encoder. Ablated against a ConvNeXt encoder of matched width/depth.
+
 2. **Thickness-consistent multi-task learning.** Joint prediction of
    segmentation, a signed-distance boundary field, and a per-voxel
    **cartilage-thickness** map. Supervising the clinical endpoint (thickness)
@@ -83,6 +89,7 @@ Same preprocessing, augmentation, patch size, and 5-fold splits for all.
 
 ## 5. Ablation matrix (SACN)
 
+- Encoder block: **Mamba (S6)** / ConvNeXt (matched width & depth).
 - Severity conditioning: none / input-concat / **FiLM** / hard-routing.
 - Severity source: oracle KL / RGSSPD soft vote / learned-from-image.
 - Aux heads: seg only / +boundary / +thickness / +both.
@@ -137,8 +144,14 @@ RGSSPD's own A1–A10 conditions (retrieval, gating, temperature, k) carry over.
 
 ## 10. Status & what is / isn't validated here
 
-- ✅ Implemented & unit/smoke-tested (CPU): `sacn_model.py` (architecture,
-  losses, target-field helpers), refined `rgsspd_module.py`.
+- ✅ Implemented & unit/smoke-tested (CPU): `mamba3d.py` (3D selective-scan
+  blocks + pure-PyTorch reference scan), `sacn_model.py` (architecture, losses,
+  target-field helpers), `sacn_integration.py` (trainer + inferer), refined
+  `rgsspd_module.py`.
+- ⚙️ **GPU setup:** install `mamba-ssm` + `causal-conv1d` on the RTX 5090 so
+  SACN's encoder uses the fast selective-scan kernel. Without it the code still
+  runs (pure-PyTorch fallback) but is far slower at high resolution — set
+  `mamba_stages` to the deeper stages only if training without the kernel.
 - ⏳ Requires GPU training on OAI-ZIB (RTX 5090): all Dice/HD95/thickness
   numbers, ablations, and statistical tests. The code here is written to be
   dropped into the existing training/eval pipeline for those runs.

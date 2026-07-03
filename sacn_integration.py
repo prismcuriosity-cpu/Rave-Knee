@@ -209,8 +209,10 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
+    S = 16   # small volume so the pure-PyTorch Mamba fallback stays fast
+
     class _Cfg:
-        img_size = (32, 32, 32)
+        img_size = (S, S, S)
         num_classes = 6
         output_dir = "./outputs_sacn_smoke/"
 
@@ -224,20 +226,22 @@ if __name__ == "__main__":
             self.label = _Img(lab)
 
     def _make(sid):
-        vol = torch.randn(1, 32, 32, 32)
-        lab = torch.zeros(1, 32, 32, 32, dtype=torch.long)
-        lab[0, 8:24, 8:24, 8:24] = 2
-        lab[0, 4:8, 4:8, 4:8] = 4
-        lab[0, 24:28, 24:28, 24:28] = 5
-        lab[0, 0:4, 0:4, 0:4] = 1
+        vol = torch.randn(1, S, S, S)
+        lab = torch.zeros(1, S, S, S, dtype=torch.long)
+        lab[0, 4:12, 4:12, 4:12] = 2
+        lab[0, 2:4, 2:4, 2:4] = 4
+        lab[0, 12:15, 12:15, 12:15] = 5
+        lab[0, 0:2, 0:2, 0:2] = 1
         return _Subject(sid, vol, lab)
 
     cfg = _Cfg()
     subjects = [_make(f"s{i}") for i in range(4)]
     kl_lookup = {"s0": 0, "s1": 2, "s2": 3, "s3": 4}
 
+    # Mamba in deeper stages only for a fast CPU smoke test (GPU: all stages).
     mcfg = SACNConfig(num_classes=6, base_channels=8, stage_depths=(1, 1, 1, 1),
-                      use_evidential=True, deep_supervision=True)
+                      use_evidential=True, deep_supervision=True,
+                      encoder_block="mamba", mamba_stages=(1, 2, 3))
     trainer = SACNTrainer(cfg, device, model_cfg=mcfg,
                           severity_source="oracle", kl_lookup=kl_lookup)
 
@@ -254,8 +258,8 @@ if __name__ == "__main__":
 
     # ── Check 3: inference returns pred + thickness + uncertainty ──
     out = trainer.predict(subjects[0])
-    assert out["pred_mask"].shape == (32, 32, 32)
-    assert out["thickness"].shape == (3, 32, 32, 32)
+    assert out["pred_mask"].shape == (S, S, S)
+    assert out["thickness"].shape == (3, S, S, S)
     assert out["uncertainty"] is not None
     print(f"✅ Check 3 — predict: pred{out['pred_mask'].shape}, "
           f"labels={np.unique(out['pred_mask']).tolist()}, "

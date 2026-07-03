@@ -30,10 +30,15 @@ motivate the design for knee OA specifically:
      voxel-wise uncertainty in a single forward pass — needed for trustworthy
      clinical deployment and increasingly expected by top-tier journals.
 
-The encoder uses 3D ConvNeXt-style blocks (depthwise 7^3 conv → channel MLP
-with layer-scale), a strong, pure-PyTorch backbone that trains stably on the
-modest cohorts typical of musculoskeletal MRI and requires no CUDA-only kernels
-(so it is CPU-smoke-testable here while you train on the RTX 5090).
+The encoder uses **3D Mamba / selective state-space (S6) blocks** (see
+`mamba3d.py`): a bidirectional selective scan over the flattened volume gives a
+linear-time *global* receptive field — stronger long-range context than
+convolutions and far cheaper than dense 3D attention — which is where the
+encoder's representational power comes from for thin, spatially-extended
+cartilage sheets. The official `mamba-ssm` CUDA kernel is used automatically on
+GPU (your RTX 5090); a correct pure-PyTorch reference scan is the fallback so
+the model stays CPU-smoke-testable here. A ConvNeXt-block encoder
+(`encoder_block="convnext"`) is retained as an ablation.
 
 Target: Medical Image Analysis / IEEE TMI. See PUBLICATION_PLAN.md for the
 experimental protocol, baselines, ablations, and statistical testing plan.
@@ -47,6 +52,8 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from mamba3d import Mamba3DBlock
 
 
 # ---------------------------------------------------------------------------
@@ -62,11 +69,19 @@ class SACNConfig:
         num_classes: total segmentation classes incl. background (OAI-ZIB: 6).
         cartilage_classes: label ids of cartilage compartments (for aux heads).
         base_channels: stage-0 width; stages scale 1/2/4/8/16x.
-        stage_depths: ConvNeXt blocks per encoder stage (4 stages).
+        stage_depths: encoder blocks per stage (4 stages).
         severity_dim: dimensionality of the severity gate vector (3: soft vote).
         drop_path: stochastic-depth rate (linearly scaled across blocks).
         use_evidential: emit Dirichlet evidence for per-voxel uncertainty.
         deep_supervision: attach seg heads at intermediate decoder scales.
+        encoder_block: "mamba" (selective state-space, default) or "convnext"
+            (kept for ablation). Mamba gives a linear-time global receptive
+            field for stronger encoder features.
+        mamba_stages: which encoder stages (0..3) use Mamba blocks; earlier,
+            high-resolution stages can stay convolutional to bound the scan
+            length. Default: all four stages. Ignored when encoder_block is
+            "convnext".
+        d_state: SSM state dimension for Mamba blocks.
     """
     in_channels: int = 1
     num_classes: int = 6
@@ -77,6 +92,9 @@ class SACNConfig:
     drop_path: float = 0.1
     use_evidential: bool = False
     deep_supervision: bool = True
+    encoder_block: str = "mamba"
+    mamba_stages: Tuple[int, ...] = (0, 1, 2, 3)
+    d_state: int = 16
 
     @property
     def num_cartilage(self) -> int:
@@ -230,7 +248,15 @@ class SACN(nn.Module):
             ConvNeXtBlock3D(dims[0], drop_path=0.0),
         )
 
-        # Encoder: 4 downsampling stages.
+        # Encoder: 4 downsampling stages. Each stage uses a Mamba block
+        # (linear-time global context) or a ConvNeXt block (ablation).
+        def _make_block(dim: int, stage_idx: int, dp: float) -> nn.Module:
+            use_mamba = (cfg.encoder_block == "mamba"
+                         and stage_idx in cfg.mamba_stages)
+            if use_mamba:
+                return Mamba3DBlock(dim, d_state=cfg.d_state, drop_path=dp)
+            return ConvNeXtBlock3D(dim, drop_path=dp)
+
         self.down_layers = nn.ModuleList()
         self.stages = nn.ModuleList()
         blk = 0
@@ -241,7 +267,7 @@ class SACN(nn.Module):
             ))
             depth = cfg.stage_depths[i]
             self.stages.append(nn.Sequential(*[
-                ConvNeXtBlock3D(dims[i + 1], drop_path=dpr[blk + j])
+                _make_block(dims[i + 1], i, dpr[blk + j])
                 for j in range(depth)
             ]))
             blk += depth
@@ -480,29 +506,39 @@ def build_target_fields(
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    import numpy as np
+    from mamba3d import Mamba3DBlock, _HAS_MAMBA_KERNEL
+
     torch.manual_seed(0)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
+    print(f"Device: {device} | mamba-ssm kernel: {_HAS_MAMBA_KERNEL}")
 
+    # Small volume + Mamba in deeper (low-token) stages so the pure-PyTorch
+    # fallback scan stays fast; on GPU with the kernel, run mamba in all stages.
+    S = 16
     cfg = SACNConfig(in_channels=1, num_classes=6, base_channels=8,
-                     stage_depths=(1, 1, 2, 1), use_evidential=True,
-                     deep_supervision=True)
+                     stage_depths=(1, 1, 1, 1), use_evidential=True,
+                     deep_supervision=True, encoder_block="mamba",
+                     mamba_stages=(1, 2, 3))
     model = SACN(cfg).to(device)
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"✅ SACN built: {n_params/1e6:.2f}M params, dims={model.dims}")
+    n_mamba = sum(isinstance(m, Mamba3DBlock) for m in model.modules())
+    assert n_mamba == 3, f"expected 3 Mamba encoder blocks, found {n_mamba}"
+    print(f"✅ SACN built: {n_params/1e6:.2f}M params, dims={model.dims}, "
+          f"mamba_blocks={n_mamba}")
 
-    x = torch.randn(2, 1, 32, 32, 32, device=device)
+    x = torch.randn(2, 1, S, S, S, device=device)
     severity = torch.tensor([[0.1, 0.2, 0.7], [0.8, 0.1, 0.1]], device=device)
 
     # ── Check 1: train-mode forward returns all heads + aux ──
     model.train()
     out = model(x, severity)
-    assert out["seg_logits"].shape == (2, 6, 32, 32, 32), out["seg_logits"].shape
-    assert out["boundary"].shape == (2, 3, 32, 32, 32)
-    assert out["thickness"].shape == (2, 3, 32, 32, 32)
+    assert out["seg_logits"].shape == (2, 6, S, S, S), out["seg_logits"].shape
+    assert out["boundary"].shape == (2, 3, S, S, S)
+    assert out["thickness"].shape == (2, 3, S, S, S)
     assert out["thickness"].min() >= 0, "thickness must be non-negative"
     assert "evidence" in out and "uncertainty" in out
-    assert out["uncertainty"].shape == (2, 1, 32, 32, 32)
+    assert out["uncertainty"].shape == (2, 1, S, S, S)
     assert "aux_seg" in out and len(out["aux_seg"]) == 2
     print(f"✅ Check 1 — forward heads OK; "
           f"unc∈[{out['uncertainty'].min():.3f},{out['uncertainty'].max():.3f}]")
@@ -527,11 +563,10 @@ if __name__ == "__main__":
     print(f"✅ Check 2 — severity conditioning live: Δlogits "
           f"{delta:.2e} (init) → {delta2:.2e} (perturbed)")
 
-    # ── Check 3: composite loss is scalar w/ grad, backprops ──
+    # ── Check 3: composite loss is scalar w/ grad, backprops through Mamba ──
     model.train()
     out = model(x, severity)
-    gt = torch.randint(0, 6, (2, 1, 32, 32, 32), device=device)
-    import numpy as np
+    gt = torch.randint(0, 6, (2, 1, S, S, S), device=device)
     bnds, thks = [], []
     for b in range(2):
         bd, th = build_target_fields(gt[b], cfg.cartilage_classes)
@@ -541,27 +576,30 @@ if __name__ == "__main__":
     loss, bd = sacn_loss(out, gt, cfg, gt_boundary, gt_thickness)
     assert loss.requires_grad and loss.ndim == 0
     loss.backward()
-    grad_norm = sum(p.grad.abs().sum() for p in model.parameters()
-                    if p.grad is not None).item()
-    assert grad_norm > 0, "no gradient flowed"
+    # Confirm gradient reaches a Mamba block parameter (encoder is training).
+    mblk = next(m for m in model.modules() if isinstance(m, Mamba3DBlock))
+    gsum = sum(p.grad.abs().sum() for p in mblk.parameters() if p.grad is not None)
+    assert gsum.item() > 0, "no gradient reached the Mamba encoder"
     print(f"✅ Check 3 — sacn_loss={loss.item():.4f} | {bd}")
 
     # ── Check 4: target-field helper shapes & signs ──
     bd, th = build_target_fields(gt[0], cfg.cartilage_classes)
-    assert bd.shape == (3, 32, 32, 32) and th.shape == (3, 32, 32, 32)
+    assert bd.shape == (3, S, S, S) and th.shape == (3, S, S, S)
     assert bd.min() >= -1.0 and bd.max() <= 1.0
     assert th.min() >= 0.0
     print(f"✅ Check 4 — target fields: boundary∈[{bd.min():.2f},{bd.max():.2f}], "
           f"thickness_max={th.max():.1f}")
 
-    # ── Check 5: non-evidential + no deep-supervision path ──
+    # ── Check 5: ConvNeXt-encoder ablation path still works ──
     cfg2 = SACNConfig(num_classes=6, base_channels=8, stage_depths=(1, 1, 1, 1),
-                      use_evidential=False, deep_supervision=False)
+                      use_evidential=False, deep_supervision=False,
+                      encoder_block="convnext")
     m2 = SACN(cfg2).to(device).train()
+    assert not any(isinstance(m, Mamba3DBlock) for m in m2.modules())
     o2 = m2(x)
     assert "evidence" not in o2 and "aux_seg" not in o2
     l2, _ = sacn_loss(o2, gt, cfg2)
     l2.backward()
-    print(f"✅ Check 5 — minimal config OK: loss={l2.item():.4f}")
+    print(f"✅ Check 5 — ConvNeXt ablation OK: loss={l2.item():.4f}")
 
     print(f"\n✅ All SACN smoke-test checks passed on device={device}")
