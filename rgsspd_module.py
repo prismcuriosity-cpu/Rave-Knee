@@ -270,6 +270,7 @@ def rgsspd_loss(
     lambda_bd: float = 0.3,
     lambda_focal: float = 0.2,
     gamma: float = 2.0,
+    boundary_sigma: float = 2.0,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """Combined Dice + boundary HD + focal loss for specialist training.
 
@@ -285,6 +286,9 @@ def rgsspd_loss(
         lambda_bd: boundary loss weight (bumped to 0.5 for 'severe').
         lambda_focal: focal loss weight.
         gamma: focal loss focusing parameter.
+        boundary_sigma: Gaussian bandwidth (in voxels) of the boundary band;
+            cross-entropy is upweighted for voxels within ~2*sigma of a
+            cartilage boundary on either side.
 
     Returns:
         total_loss: scalar tensor with grad.
@@ -316,17 +320,22 @@ def rgsspd_loss(
     dice_loss = dice_per_class[1:].mean()  # skip background class 0
 
     # ── Boundary HD loss (distance-transform weighted CE) ───────────────────
-    # Compute on CPU (scipy) then move to device
+    # Upweight CE for voxels near each cartilage boundary. The unsigned
+    # distance-to-boundary is dt_in (inside the region) + dt_out (outside);
+    # both are zero exactly on the boundary, so a Gaussian of that distance
+    # forms a symmetric band straddling the surface — the region reviewers
+    # care about for thin-structure Dice / HD95. (Compute on CPU via scipy.)
     gt_np = gt_long[:, 0].detach().cpu().numpy()  # (B, D, H, W)
     bd_weights = np.zeros_like(gt_np, dtype=np.float32)
+    two_sig2 = 2.0 * (boundary_sigma ** 2) + eps
     for b in range(B):
         for c in range(1, num_classes):  # skip background
             cls_bin = (gt_np[b] == c)
-            if cls_bin.any():
-                dt = scipy_ndimage.distance_transform_edt(~cls_bin).astype(np.float32)
-                # Normalise and invert: regions near boundary get higher weight
-                dt = np.clip(dt / (dt.max() + eps), 0, 1)
-                bd_weights[b] += (1.0 - dt) * cls_bin
+            if cls_bin.any() and not cls_bin.all():
+                dt_in = scipy_ndimage.distance_transform_edt(cls_bin)
+                dt_out = scipy_ndimage.distance_transform_edt(~cls_bin)
+                dist_to_boundary = (dt_in + dt_out).astype(np.float32)
+                bd_weights[b] += np.exp(-(dist_to_boundary ** 2) / two_sig2)
 
     bd_weights_t = torch.from_numpy(bd_weights).to(pred_logits.device)  # (B,D,H,W)
     log_probs = torch.log_softmax(pred_logits, dim=1)
@@ -1481,37 +1490,65 @@ class RGSSPDAblationRunner:
         df = pd.DataFrame(rows)
         return df
 
+    # OAI-ZIB label layout. `cartilage_classes` drive the clinically-relevant
+    # mean-Dice (thin structures are the segmentation bottleneck in knee OA).
+    CLASS_NAMES: Dict[int, str] = {
+        1: "Femur", 2: "FC", 3: "Tibia", 4: "MTC", 5: "LTC",
+    }
+    CARTILAGE_CLASSES = (2, 4, 5)  # FC, MTC, LTC
+
+    @classmethod
+    def _class_names(cls, num_classes: Optional[int] = None) -> Dict[int, str]:
+        if num_classes is None:
+            return dict(cls.CLASS_NAMES)
+        return {c: cls.CLASS_NAMES.get(c, f"C{c}") for c in range(1, num_classes)}
+
     # ------------------------------------------------------------------
-    @staticmethod
-    def compute_metrics_single(result: dict) -> dict:
-        """Compute per-class Dice and HD95 for a single result dict."""
+    @classmethod
+    def compute_metrics_single(cls, result: dict) -> dict:
+        """Per-class Dice and HD95 for a single result dict.
+
+        Evaluates every foreground class present in the ground truth (named per
+        the OAI-ZIB layout). `mean_dice`/`mean_hd95` average over cartilage
+        classes — the clinically decisive structures — while `mean_dice_all`
+        covers all foreground labels for completeness.
+        """
         pred = result.get("pred_mask")
         gt = result.get("gt_mask")
         row: Dict[str, Any] = {}
 
+        names = cls._class_names(None)
         if pred is None or gt is None:
-            for c, n in enumerate(["FC", "TC", "PC"], start=1):
+            for c, n in names.items():
                 row[f"dice_{n}"] = np.nan
                 row[f"hd95_{n}"] = np.nan
             row["mean_dice"] = np.nan
             row["mean_hd95"] = np.nan
+            row["mean_dice_all"] = np.nan
             return row
 
-        class_map = {1: "FC", 2: "TC", 3: "PC"}
-        dices, hds = [], []
-        for c, name in class_map.items():
+        # Cover every label present in gt or pred (robust to 6-class layout)
+        labels = sorted(
+            int(v) for v in np.union1d(np.unique(gt), np.unique(pred)) if v > 0
+        )
+        cart_dices, cart_hds, all_dices = [], [], []
+        for c in labels:
+            name = names.get(c, f"C{c}")
             p_bin = (pred == c)
             g_bin = (gt == c)
             d = _dice_binary(p_bin, g_bin)
             h = _hd95(p_bin, g_bin)
             row[f"dice_{name}"] = d
             row[f"hd95_{name}"] = h
-            dices.append(d)
-            if not np.isnan(h):
-                hds.append(h)
+            all_dices.append(d)
+            if c in cls.CARTILAGE_CLASSES:
+                cart_dices.append(d)
+                if not np.isnan(h):
+                    cart_hds.append(h)
 
-        row["mean_dice"] = float(np.nanmean(dices))
-        row["mean_hd95"] = float(np.nanmean(hds)) if hds else np.nan
+        row["mean_dice"] = float(np.nanmean(cart_dices)) if cart_dices else np.nan
+        row["mean_hd95"] = float(np.nanmean(cart_hds)) if cart_hds else np.nan
+        row["mean_dice_all"] = float(np.nanmean(all_dices)) if all_dices else np.nan
         return row
 
     # ------------------------------------------------------------------
@@ -1531,7 +1568,8 @@ class RGSSPDAblationRunner:
         df["kl_grade"] = [r.get("kl_grade") for r in results]
 
         strata = {"mild": [0, 1], "moderate": [2], "severe": [3, 4], "all": list(range(5))}
-        classes = {"FC": "dice_FC", "TC": "dice_TC", "PC": "dice_PC"}
+        classes = {self.CLASS_NAMES[c]: f"dice_{self.CLASS_NAMES[c]}"
+                   for c in self.CARTILAGE_CLASSES}
         out: Dict[str, Any] = {}
 
         for st_name, kl_grades in strata.items():
@@ -1558,42 +1596,49 @@ class RGSSPDAblationRunner:
         Returns:
             LaTeX table string with best-per-metric bolded.
         """
-        cols = ["condition", "mean_dice", "dice_FC", "dice_TC", "dice_PC",
-                "mean_hd95", "blend_w_mild", "blend_w_moderate", "blend_w_severe"]
+        # Derive per-cartilage-class columns dynamically so the table follows
+        # whatever CLASS_NAMES / CARTILAGE_CLASSES define (avoids stale columns).
+        cart_cols = [f"dice_{self.CLASS_NAMES[c]}" for c in self.CARTILAGE_CLASSES
+                     if f"dice_{self.CLASS_NAMES[c]}" in df.columns]
+        dice_metrics = ["mean_dice"] + cart_cols
+        cols = (["condition"] + dice_metrics + ["mean_hd95",
+                "blend_w_mild", "blend_w_moderate", "blend_w_severe"])
+        cols = [c for c in cols if c in df.columns]
         agg = (df[cols].groupby("condition").agg(["mean", "std"])
                .round(3))
 
         # Find best per column
-        bests_high = {c: agg[(c, "mean")].max() for c in
-                      ["mean_dice", "dice_FC", "dice_TC", "dice_PC"]}
-        bests_low = {"mean_hd95": agg[("mean_hd95", "mean")].min()}
+        bests_high = {c: agg[(c, "mean")].max() for c in dice_metrics
+                      if (c, "mean") in agg.columns}
+        bests_low = {"mean_hd95": agg[("mean_hd95", "mean")].min()} \
+            if ("mean_hd95", "mean") in agg.columns else {}
 
+        header_names = ["mDice"] + [c.replace("dice_", "Dice-") for c in cart_cols]
+        n_metric_cols = len(header_names) + 1  # + HD95
         lines = [
             r"\begin{table}[t]",
             r"\centering",
             r"\caption{RGSSPD Ablation Results}",
             r"\label{tab:ablation}",
-            r"\begin{tabular}{lcccccc}",
+            r"\begin{tabular}{l" + "c" * n_metric_cols + "}",
             r"\toprule",
-            r"Condition & mDice & Dice-FC & Dice-TC & Dice-PC & HD95 \\",
+            "Condition & " + " & ".join(header_names) + r" & HD95 \\",
             r"\midrule",
         ]
 
+        metric_spec = [(m, True) for m in dice_metrics] + [("mean_hd95", False)]
         for cond in self.ALL_CONDITIONS:
             if cond not in agg.index:
                 continue
             cells = [cond.replace("_", r"\_")]
-            for metric, higher_better in [
-                ("mean_dice", True), ("dice_FC", True), ("dice_TC", True),
-                ("dice_PC", True), ("mean_hd95", False),
-            ]:
+            for metric, higher_better in metric_spec:
+                if (metric, "mean") not in agg.columns:
+                    continue
                 mu = agg.loc[cond, (metric, "mean")]
                 sd = agg.loc[cond, (metric, "std")]
                 cell = f"{mu:.3f}$\\pm${sd:.3f}"
                 best_val = bests_high.get(metric, bests_low.get(metric))
-                if (higher_better and mu == best_val) or (
-                    not higher_better and mu == best_val
-                ):
+                if best_val is not None and mu == best_val:
                     cell = r"\textbf{" + cell + r"}"
                 cells.append(cell)
             lines.append(" & ".join(cells) + r" \\")
