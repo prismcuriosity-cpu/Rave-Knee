@@ -98,22 +98,42 @@ class SACNTrainer:
         self.model = SACN(self.model_cfg).to(device)
         self._dev_type = (device.type if isinstance(device, torch.device)
                           else str(device).split(":")[0])
+        # Severity is static per subject → compute once, reuse across epochs.
+        self._sev_cache: Dict[str, torch.Tensor] = {}
 
     # ------------------------------------------------------------------
-    def _severity_for(self, subj: Any, vol: torch.Tensor) -> torch.Tensor:
+    def _rgsspd_vote(self, subj: Any, vol: Optional[torch.Tensor]) -> np.ndarray:
+        """Cheap soft KL vote from RGSSPD's retrieval — embedding + FAISS +
+        neighbour vote only, WITHOUT running full segmentation inference."""
+        import faiss
+        from rgsspd_module import _extract_embedding, _pad_to
+        ri = self.rgsspd_infer
+        try:
+            if vol is None:
+                vol, _ = _subject_tensors(subj, self.device, self.transform_fn)
+            v = _pad_to(vol, self.cfg.img_size)
+            emb = _extract_embedding(ri.backbone, v).reshape(1, -1).astype(np.float32).copy()
+            faiss.normalize_L2(emb)
+            k = getattr(self.cfg, "k_neighbors", 3)
+            _, idx = ri.faiss_index.search(emb, k)
+            return ri.compute_blend_weights(idx[0]).detach().cpu().numpy().astype(np.float32)
+        except Exception:
+            return np.full(3, 1.0 / 3, dtype=np.float32)
+
+    def _severity_for(self, subj: Any, vol: Optional[torch.Tensor]) -> torch.Tensor:
+        sid = getattr(subj, "subject_id", None)
+        if sid is not None and sid in self._sev_cache:
+            return self._sev_cache[sid]
         if self.severity_source == "oracle":
-            sid = getattr(subj, "subject_id", None)
             sev = kl_to_severity_onehot(self.kl_lookup.get(sid))
         elif self.severity_source == "rgsspd" and self.rgsspd_infer is not None:
-            emb = self.rgsspd_infer  # reuse its FAISS + soft-vote machinery
-            try:
-                out = emb.predict(subj, {})
-                sev = np.asarray(out["blend_weights"], dtype=np.float32)
-            except Exception:
-                sev = np.full(3, 1.0 / 3, dtype=np.float32)
+            sev = self._rgsspd_vote(subj, vol)
         else:
             sev = np.full(3, 1.0 / 3, dtype=np.float32)
-        return torch.from_numpy(sev).to(self.device).unsqueeze(0)
+        t = torch.from_numpy(sev).to(self.device).unsqueeze(0)
+        if sid is not None:
+            self._sev_cache[sid] = t
+        return t
 
     # ------------------------------------------------------------------
     def _targets(self, msk: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
