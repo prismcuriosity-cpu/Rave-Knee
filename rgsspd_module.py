@@ -135,6 +135,12 @@ def _coerce_kl(v: Any) -> Optional[int]:
         return None
     if isinstance(v, bool):  # guard: bool is a subclass of int
         return None
+    if isinstance(v, dict):
+        # Metadata-row lookups store the grade under a nested field.
+        for key in ("kl_grade", "kl", "KL", "KLG", "grade", "kl_grade_int"):
+            if key in v:
+                return _coerce_kl(v[key])
+        return None
     if isinstance(v, (int, np.integer)):
         return int(v)
     if isinstance(v, (float, np.floating)):
@@ -225,6 +231,17 @@ def diagnose_kl_matching(train_subjects: List[Any],
         print(f"    sample lookup vals: {[ (repr(v), type(v).__name__) for v in vals ]}")
         print("    → align kl_lookup keys with subject.subject_id, and ensure "
               "KL values are ints (0–4), not strings/None.")
+        # Targeted hints for the two most common schema mismatches.
+        if vals and any(isinstance(v, dict) for v in vals):
+            print("    HINT: values are dicts — the grade is nested; rebuild as "
+                  "kl_lookup[sid] = meta['kl_grade'].")
+        import re as _re
+        key_is_int = all(isinstance(k, (int, np.integer)) for k in keys) and keys
+        sid_has_num = any(_re.search(r"\d+", str(x)) for x in sids if x is not None)
+        if key_is_int and sid_has_num:
+            print("    HINT: keys are integer indices but subject_id is a string "
+                  "like 'oaizib_132' — map via the numeric part "
+                  "(int(sid.split('_')[-1])), then VERIFY the KL distribution.")
     return {"n": n, "matched": matched, **counts}
 
 
