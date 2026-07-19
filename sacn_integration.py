@@ -26,6 +26,7 @@ import torch
 import torch.nn.functional as F
 
 from sacn_model import SACN, SACNConfig, build_target_fields, sacn_loss
+from rgsspd_module import _coerce_kl, _lookup_kl, _normalize_kl_lookup
 
 try:
     from monai.inferers import SlidingWindowInferer  # type: ignore
@@ -37,7 +38,12 @@ _STRATA = {"mild": (0, 1), "moderate": (2,), "severe": (3, 4)}
 
 
 def kl_to_severity_onehot(kl: Optional[int]) -> np.ndarray:
-    """True KL grade → one-hot severity gate [mild, moderate, severe]."""
+    """True KL grade → one-hot severity gate [mild, moderate, severe].
+
+    Coerces string/float KL grades to int so a lookup value like "3" or 3.0
+    still routes to the correct stratum instead of the uniform fallback.
+    """
+    kl = _coerce_kl(kl)
     v = np.zeros(3, dtype=np.float32)
     if kl is None:
         return np.full(3, 1.0 / 3, dtype=np.float32)
@@ -87,7 +93,7 @@ class SACNTrainer:
         self.cfg = cfg
         self.device = device
         self.severity_source = severity_source
-        self.kl_lookup = kl_lookup or {}
+        self.kl_lookup = _normalize_kl_lookup(kl_lookup or {})
         self.rgsspd_infer = rgsspd_infer
         self.transform_fn = transform_fn
         self.output_dir = getattr(cfg, "output_dir", "./outputs/")
@@ -125,7 +131,7 @@ class SACNTrainer:
         if sid is not None and sid in self._sev_cache:
             return self._sev_cache[sid]
         if self.severity_source == "oracle":
-            sev = kl_to_severity_onehot(self.kl_lookup.get(sid))
+            sev = kl_to_severity_onehot(_lookup_kl(self.kl_lookup, subj))
         elif self.severity_source == "rgsspd" and self.rgsspd_infer is not None:
             sev = self._rgsspd_vote(subj, vol)
         else:

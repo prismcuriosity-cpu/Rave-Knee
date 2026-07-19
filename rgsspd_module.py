@@ -124,6 +124,110 @@ def _dice_binary(pred: np.ndarray, gt: np.ndarray, eps: float = 1e-6) -> float:
     return float((2 * tp + eps) / (pred.sum() + gt.sum() + eps))
 
 
+def _coerce_kl(v: Any) -> Optional[int]:
+    """Coerce a KL grade to an int, or None.
+
+    Handles the common formats that silently break stratum matching:
+    numpy ints/floats, float grades (2.0), and string grades ("2", " 3 "),
+    plus NaN / empty / 'nan' / 'none' sentinels.
+    """
+    if v is None:
+        return None
+    if isinstance(v, bool):  # guard: bool is a subclass of int
+        return None
+    if isinstance(v, (int, np.integer)):
+        return int(v)
+    if isinstance(v, (float, np.floating)):
+        return None if np.isnan(v) else int(round(float(v)))
+    if isinstance(v, str):
+        s = v.strip()
+        if s == "" or s.lower() in ("nan", "none", "na", "n/a"):
+            return None
+        try:
+            return int(round(float(s)))
+        except ValueError:
+            return None
+    return None
+
+
+def _normalize_kl_lookup(
+    kl_lookup: Dict[Any, Optional[int]]
+) -> Dict[Any, Optional[int]]:
+    """Return a KL lookup robust to subject-id key-type mismatches.
+
+    Each entry is indexed under the original key, its ``str`` form, and its
+    ``int`` form (when numeric), and every value is coerced via ``_coerce_kl``.
+    This absorbs the int-vs-str ``subject_id`` mismatch that otherwise makes
+    every ``kl_lookup.get(sid)`` return ``None`` (all strata empty).
+    """
+    norm: Dict[Any, Optional[int]] = {}
+    for k, v in kl_lookup.items():
+        cv = _coerce_kl(v)
+        keys = {k, str(k)}
+        try:
+            keys.add(int(str(k).strip()))
+        except (ValueError, TypeError):
+            pass
+        for kk in keys:
+            # Don't let a None-valued alias clobber a real grade on collision.
+            if kk not in norm or norm[kk] is None:
+                norm[kk] = cv
+    return norm
+
+
+def _lookup_kl(kl_lookup: Dict[Any, Optional[int]], subj: Any) -> Optional[int]:
+    """Fetch a subject's KL grade, trying the id in both int and str form."""
+    sid = getattr(subj, "subject_id", None)
+    if sid is None:
+        return None
+    if sid in kl_lookup:
+        return kl_lookup[sid]
+    v = kl_lookup.get(str(sid))
+    if v is not None:
+        return v
+    try:
+        return kl_lookup.get(int(str(sid).strip()))
+    except (ValueError, TypeError):
+        return None
+
+
+def diagnose_kl_matching(train_subjects: List[Any],
+                         kl_lookup: Dict[Any, Optional[int]],
+                         n_samples: int = 6) -> Dict[str, Any]:
+    """Report how many subjects successfully resolve to a KL grade.
+
+    Prints an actionable summary and, when nothing matches, side-by-side
+    samples of subject ids vs. lookup keys so the mismatch is obvious. Returns
+    a dict of counts for programmatic checks.
+    """
+    norm = _normalize_kl_lookup(kl_lookup)
+    n = len(train_subjects)
+    matched = sum(1 for s in train_subjects if _lookup_kl(norm, s) is not None)
+    strata = {"mild": [0, 1], "moderate": [2], "severe": [3, 4]}
+    counts = {st: 0 for st in strata}
+    for s in train_subjects:
+        kl = _lookup_kl(norm, s)
+        for st, grades in strata.items():
+            if kl in grades:
+                counts[st] += 1
+                break
+
+    print(f"[KL diagnosis] {matched}/{n} subjects resolved to a KL grade "
+          f"| mild={counts['mild']} moderate={counts['moderate']} "
+          f"severe={counts['severe']}")
+    if matched == 0:
+        sids = [getattr(s, "subject_id", None) for s in train_subjects[:n_samples]]
+        keys = list(kl_lookup.keys())[:n_samples]
+        vals = [kl_lookup[k] for k in keys]
+        print("  ⚠ No subject matched kl_lookup. Likely a key/type mismatch.")
+        print(f"    sample subject_id : {[ (repr(x), type(x).__name__) for x in sids ]}")
+        print(f"    sample lookup keys: {[ (repr(x), type(x).__name__) for x in keys ]}")
+        print(f"    sample lookup vals: {[ (repr(v), type(v).__name__) for v in vals ]}")
+        print("    → align kl_lookup keys with subject.subject_id, and ensure "
+              "KL values are ints (0–4), not strings/None.")
+    return {"n": n, "matched": matched, **counts}
+
+
 # ---------------------------------------------------------------------------
 # Component 1 — SeveritySpecialistHead
 # ---------------------------------------------------------------------------
@@ -408,12 +512,18 @@ class RGSSPDTrainer:
         self.faiss_index = faiss_index
         self.index_embeddings = index_embeddings.astype(np.float32)
         self.train_subjects = train_subjects
-        self.kl_lookup = kl_lookup
+        # Robust to str/int key mismatch and string/float KL values so stratum
+        # matching does not silently yield zero subjects.
+        self.kl_lookup = _normalize_kl_lookup(kl_lookup)
         self.cfg = cfg
         self.device = device
         self.transform_fn = transform_fn
         self.output_dir = output_dir or getattr(cfg, "output_dir", "./outputs/")
         os.makedirs(self.output_dir, exist_ok=True)
+
+        # Surface KL-matching problems up front (all-zero strata are otherwise
+        # only visible as silent "TOO SMALL — will skip" warnings later).
+        diagnose_kl_matching(train_subjects, kl_lookup)
 
         # Freeze backbone
         for p in backbone.parameters():
@@ -498,8 +608,7 @@ class RGSSPDTrainer:
         sub_indices, sub_subjects = [], []
 
         for i, subj in enumerate(self.train_subjects):
-            sid = getattr(subj, "subject_id", None)
-            kl = self.kl_lookup.get(sid) if sid is not None else None
+            kl = _lookup_kl(self.kl_lookup, subj)
             if kl in valid_grades:
                 sub_indices.append(i)
                 sub_subjects.append(subj)
@@ -860,7 +969,7 @@ class RGSSPDInference:
         self.faiss_index = faiss_index
         self.index_embeddings = index_embeddings.astype(np.float32)
         self.train_subjects = train_subjects
-        self.kl_lookup = kl_lookup
+        self.kl_lookup = _normalize_kl_lookup(kl_lookup)
         self.heads = specialist_heads
         self.fusion_logit = fusion_logit
         self.cfg = cfg
@@ -1175,7 +1284,7 @@ class RGSSPDAblationRunner:
         self.index_embeddings = index_embeddings.astype(np.float32)
         self.train_subjects = train_subjects
         self.eval_subjects = eval_subjects
-        self.kl_lookup = kl_lookup
+        self.kl_lookup = _normalize_kl_lookup(kl_lookup)
         self.heads = specialist_heads
         self.fusion_logit = fusion_logit
         self.cfg = cfg
