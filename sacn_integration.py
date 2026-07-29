@@ -19,7 +19,8 @@ and self-tests on synthetic data under `__main__`.
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, List, Optional, Tuple
+import random
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -70,6 +71,57 @@ def _pad_to(vol: torch.Tensor, target: Tuple[int, int, int]) -> torch.Tensor:
     if any(p > 0 for p in pad):
         vol = F.pad(vol, pad)
     return vol[:, :, :target[0], :target[1], :target[2]]
+
+
+def _pad_at_least(vol: torch.Tensor, target: Tuple[int, int, int],
+                  value: float = 0.0) -> torch.Tensor:
+    """Pad (never crop) so every spatial dim is >= target."""
+    shape = vol.shape[2:]
+    pad: List[int] = []
+    for i in range(2, -1, -1):
+        pad.extend([0, max(0, target[i] - shape[i])])
+    if any(p > 0 for p in pad):
+        vol = F.pad(vol, pad, value=value)
+    return vol
+
+
+def sample_patch(
+    vol: torch.Tensor, msk: torch.Tensor, patch: Tuple[int, int, int],
+    cartilage_classes: Sequence[int], fg_prob: float = 0.75,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Random foreground-biased crop of (vol, msk) to `patch` size.
+
+    3D segmentation is trained on patches, not whole volumes — this bounds the
+    Mamba scan length (and every activation) to the patch, which is the fix for
+    the full-volume CUDA OOM. With probability `fg_prob` the patch is centred on
+    a random cartilage voxel so thin structures are seen often enough.
+
+    vol, msk: (1, 1, D, H, W). Returns crops of the same rank.
+    """
+    vol = _pad_at_least(vol, patch)
+    msk = _pad_at_least(msk, patch)
+    D, H, W = vol.shape[2:]
+    pd, ph, pw = patch
+
+    z0 = y0 = x0 = None
+    if random.random() < fg_prob:
+        fg = torch.zeros(D, H, W, dtype=torch.bool, device=msk.device)
+        for c in cartilage_classes:
+            fg |= (msk[0, 0] == c)
+        nz = torch.nonzero(fg, as_tuple=False)
+        if nz.numel() > 0:
+            cz, cy, cx = nz[random.randrange(nz.shape[0])].tolist()
+            z0 = min(max(cz - pd // 2, 0), D - pd)
+            y0 = min(max(cy - ph // 2, 0), H - ph)
+            x0 = min(max(cx - pw // 2, 0), W - pw)
+    if z0 is None:
+        z0 = random.randint(0, D - pd)
+        y0 = random.randint(0, H - ph)
+        x0 = random.randint(0, W - pw)
+
+    vp = vol[:, :, z0:z0 + pd, y0:y0 + ph, x0:x0 + pw]
+    mp = msk[:, :, z0:z0 + pd, y0:y0 + ph, x0:x0 + pw]
+    return vp, mp
 
 
 class SACNTrainer:
@@ -151,13 +203,31 @@ class SACNTrainer:
     # ------------------------------------------------------------------
     def train(self, train_subjects: List[Any], num_epochs: int = 100,
               lr: float = 2e-4, weight_decay: float = 1e-4,
-              grad_clip: float = 1.0) -> Dict[str, Any]:
-        """Full training loop (single-subject batches; accumulate as needed)."""
+              grad_clip: float = 1.0,
+              patch_size: Optional[Tuple[int, int, int]] = None,
+              patches_per_subject: int = 1,
+              empty_cache_every: int = 0) -> Dict[str, Any]:
+        """Patch-based training loop (memory-bounded).
+
+        Trains on random foreground-biased crops of ``patch_size`` rather than
+        whole volumes, so activation memory (and the Mamba scan length) is
+        bounded by the patch — the fix for full-volume CUDA OOM. Inference still
+        stitches the whole volume with a sliding window (see ``predict``).
+
+        Args:
+            patch_size: crop size; defaults to ``cfg.patch_size`` or (96,96,96).
+                Shrink this first if you still hit OOM.
+            patches_per_subject: random crops per subject per epoch.
+            empty_cache_every: call ``torch.cuda.empty_cache`` every N steps
+                (0 disables) to fight fragmentation on tight cards.
+        """
         opt = torch.optim.AdamW(self.model.parameters(), lr=lr,
                                 weight_decay=weight_decay)
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=num_epochs)
-        img = self.cfg.img_size
+        patch = tuple(patch_size or getattr(self.cfg, "patch_size", (96, 96, 96)))
+        cart = self.model_cfg.cartilage_classes
         history: List[float] = []
+        step = 0
 
         for epoch in range(1, num_epochs + 1):
             self.model.train()
@@ -166,25 +236,35 @@ class SACNTrainer:
                 vol, msk = _subject_tensors(subj, self.device, self.transform_fn)
                 if msk is None:
                     continue
-                vol = _pad_to(vol, img)
-                msk = _pad_to(msk.float(), img).long()
-                sev = self._severity_for(subj, vol)
-                gt_boundary, gt_thickness = self._targets(msk)
+                sev = self._severity_for(subj, vol)   # global gate (pre-crop)
+                msk = msk.float()
                 ramp = min(1.0, epoch / max(1, num_epochs // 5))
 
-                opt.zero_grad()
-                with torch.autocast(device_type=self._dev_type,
-                                    dtype=torch.bfloat16,
-                                    enabled=(self._dev_type == "cuda")):
-                    out = self.model(vol, sev)
-                    loss, _ = sacn_loss(
-                        out, msk, self.model_cfg,
-                        gt_boundary=gt_boundary, gt_thickness=gt_thickness,
-                        evidential_ramp=ramp)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), grad_clip)
-                opt.step()
-                losses.append(float(loss.detach()))
+                for _ in range(patches_per_subject):
+                    vp, mp = sample_patch(vol, msk, patch, cart)
+                    mp = mp.long()
+                    gt_boundary, gt_thickness = self._targets(mp)
+
+                    opt.zero_grad(set_to_none=True)
+                    with torch.autocast(device_type=self._dev_type,
+                                        dtype=torch.bfloat16,
+                                        enabled=(self._dev_type == "cuda")):
+                        out = self.model(vp, sev)
+                        loss, _ = sacn_loss(
+                            out, mp, self.model_cfg,
+                            gt_boundary=gt_boundary, gt_thickness=gt_thickness,
+                            evidential_ramp=ramp)
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(),
+                                                   grad_clip)
+                    opt.step()
+                    losses.append(float(loss.detach()))
+                    step += 1
+                    if (empty_cache_every and self._dev_type == "cuda"
+                            and step % empty_cache_every == 0):
+                        torch.cuda.empty_cache()
+
+                del vol, msk
             sched.step()
             history.append(float(np.mean(losses)) if losses else float("nan"))
 
@@ -265,9 +345,11 @@ if __name__ == "__main__":
     kl_lookup = {"s0": 0, "s1": 2, "s2": 3, "s3": 4}
 
     # Mamba in deeper stages only for a fast CPU smoke test (GPU: all stages).
+    # use_checkpoint exercises the gradient-checkpointing path.
     mcfg = SACNConfig(num_classes=6, base_channels=8, stage_depths=(1, 1, 1, 1),
                       use_evidential=True, deep_supervision=True,
-                      encoder_block="mamba", mamba_stages=(1, 2, 3))
+                      encoder_block="mamba", mamba_stages=(1, 2, 3),
+                      use_checkpoint=True)
     trainer = SACNTrainer(cfg, device, model_cfg=mcfg,
                           severity_source="oracle", kl_lookup=kl_lookup)
 
@@ -276,11 +358,19 @@ if __name__ == "__main__":
     assert tuple(s.squeeze(0).tolist()) == (0.0, 0.0, 1.0), s
     print(f"✅ Check 1 — oracle severity (KL3→severe) = {s.squeeze(0).tolist()}")
 
-    # ── Check 2: 2-epoch train loop runs and loss is finite ──
-    res = trainer.train(subjects, num_epochs=2, lr=1e-3)
+    # ── Check 2: patch-based train loop runs and loss is finite ──
+    res = trainer.train(subjects[:2], num_epochs=1, lr=1e-3,
+                        patch_size=(S, S, S), patches_per_subject=1)
     assert np.isfinite(res["epoch_losses"]).all(), res["epoch_losses"]
     assert os.path.exists(res["checkpoint_path"])
-    print(f"✅ Check 2 — train 2 epochs, losses={np.round(res['epoch_losses'],3)}")
+    print(f"✅ Check 2 — patch train, losses={np.round(res['epoch_losses'],3)}")
+
+    # ── Check 2b: sample_patch crops a larger volume down to patch size ──
+    big = torch.randn(1, 1, 24, 20, 18)
+    bigm = torch.zeros(1, 1, 24, 20, 18); bigm[0, 0, 5:12, 5:12, 5:12] = 2
+    vp, mp = sample_patch(big, bigm, (16, 16, 16), (2, 4, 5))
+    assert vp.shape == (1, 1, 16, 16, 16) and mp.shape == (1, 1, 16, 16, 16)
+    print(f"✅ Check 2b — sample_patch 24×20×18 → {tuple(vp.shape[2:])}")
 
     # ── Check 3: inference returns pred + thickness + uncertainty ──
     out = trainer.predict(subjects[0])
