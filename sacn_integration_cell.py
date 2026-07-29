@@ -47,6 +47,7 @@ sacn_cfg = SACNConfig(
     deep_supervision=True,
     encoder_block="mamba",
     mamba_stages=mamba_stages,
+    use_checkpoint=True,        # gradient-checkpoint encoder stages (saves VRAM)
 )
 
 # ─── 2. Trainer — severity from RGSSPD soft vote if available, else oracle ────
@@ -72,8 +73,15 @@ if os.path.exists(ckpt_path):
     sacn_trainer.model.load_state_dict(state["model"])
     print("✅ SACN loaded from checkpoint")
 else:
-    print("\nNo checkpoint — training SACN …")
-    res = sacn_trainer.train(train_subjects, num_epochs=100)
+    print("\nNo checkpoint — training SACN (patch-based, memory-bounded) …")
+    # 3D nets train on patches, NOT whole volumes — this bounds VRAM and the
+    # Mamba scan length. Shrink patch_size first if you still hit CUDA OOM.
+    res = sacn_trainer.train(
+        train_subjects, num_epochs=100,
+        patch_size=(96, 96, 96),   # try (64,64,64) if memory is tight
+        patches_per_subject=2,
+        empty_cache_every=8,
+    )
     print(f"✅ Training done. final loss = {res['epoch_losses'][-1]:.4f}")
 
 torch.cuda.empty_cache()

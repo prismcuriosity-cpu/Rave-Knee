@@ -52,6 +52,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
 
 from mamba3d import Mamba3DBlock
 
@@ -95,6 +96,7 @@ class SACNConfig:
     encoder_block: str = "mamba"
     mamba_stages: Tuple[int, ...] = (0, 1, 2, 3)
     d_state: int = 16
+    use_checkpoint: bool = False   # gradient-checkpoint encoder stages (saves memory)
 
     @property
     def num_cartilage(self) -> int:
@@ -310,9 +312,14 @@ class SACN(nn.Module):
         s0 = self.stem(x)                     # full res, dims[0]
         skips = [s0]
         feat = s0
+        use_ckpt = getattr(self.cfg, "use_checkpoint", False) and self.training
         for down, stage in zip(self.down_layers, self.stages):
             feat = down(feat)
-            feat = stage(feat)
+            if use_ckpt:
+                feat = torch.utils.checkpoint.checkpoint(
+                    stage, feat, use_reentrant=False)
+            else:
+                feat = stage(feat)
             skips.append(feat)                # dims[1..4] at /2../16
         # skips = [s0(/1), s1(/2), s2(/4), s3(/8), s4(/16)]
 
